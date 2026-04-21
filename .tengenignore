@@ -17,3 +17,8 @@
 # The AI-antipatterns catalogue shows bad-then-good examples and will
 # light up every rule; that is the point of the document.
 *:docs/AI_ANTIPATTERNS\.md
+
+# The scanner module itself carries example patterns inside the `fix` /
+# `why` strings of each detector definition — these are documentation,
+# not executable vulnerabilities.
+*:src/lib/tengen/scanner\.ts
