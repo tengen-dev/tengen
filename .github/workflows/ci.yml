@@ -18,7 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22']
+        # Node 22 LTS. We don't support Node 20 because `node --test` only
+        # gained glob-pattern support in 22; see npm test script.
+        node: ['22']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,6 +79,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+          # Disable module cache — loader has no external deps + no go.sum.
+          cache: false
       - name: go vet
         run: go vet ./...
         working-directory: loader

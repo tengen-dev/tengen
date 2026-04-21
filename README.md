@@ -83,6 +83,9 @@ unnecessary attack surface and has been deliberately omitted.
 
 ## Build & run
 
+Requires **Node 22+** (the test runner relies on `node --test` glob support
+that landed in 22).
+
 ```bash
 npm install
 npm run typecheck
