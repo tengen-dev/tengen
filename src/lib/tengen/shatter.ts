@@ -145,12 +145,20 @@ export const shatter = async (
   const keyShares = split(dek, k, n);
   zeroize(dek);
 
+  // Every chunk is padded to exactly chunkSize so that every blob body
+  // ends up at chunkSize + 16 bytes (GCM tag). Without this, the last
+  // chunk would be shorter and stand out in the size histogram (audit
+  // finding H). The true ciphertext length lives in manifest.size and
+  // is used at reassemble-time to strip the zero padding before the
+  // outer AES-GCM decrypt.
   const chunkSize = Math.ceil(cipher.length / n);
   const realBlobs: ShardBlob[] = [];
   const salts: Uint8Array[] = [];
 
   for (let i = 0; i < n; i++) {
-    const chunk = cipher.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, cipher.length));
+    const slice = cipher.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, cipher.length));
+    const chunk = new Uint8Array(chunkSize);
+    chunk.set(slice); // trailing bytes stay zero-filled
     const salt = randomBytes(16);
     const addr = await addrFromSalt(session, salt);
     const shardKey = await keyFromAddr(session, addr);
@@ -158,6 +166,7 @@ export const shatter = async (
     // AAD = addr only — no index, no Shamir x, no session-id in the blob.
     const body = await aesGcmEncrypt(shardKey, shardIv, chunk, addr);
     zeroize(shardKey);
+    zeroize(chunk);
     const backend = await pickBackend(session, addr, backends);
     realBlobs.push({ addr: b64u.encode(addr), body, backend });
     salts.push(salt);
@@ -231,7 +240,11 @@ export const reassemble = async (
   const shares: Share[] = manifest.shares.slice(0, manifest.k).map((s) => ({ x: s.x, y: s.y }));
   const dek = combine(shares);
   try {
-    const cipher = concat(...chunks);
+    // Chunks are zero-padded to uniform size during shatter() (finding H).
+    // Strip padding by truncating the concatenation to the true ciphertext
+    // length = plaintext size + GCM tag (16).
+    const padded = concat(...chunks);
+    const cipher = padded.subarray(0, manifest.size + 16);
     const aad = concat(enc.encode('tengen:data:v1'), session.id);
     return await aesGcmDecrypt(dek, manifest.iv, cipher, aad);
   } finally {

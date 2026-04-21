@@ -20,9 +20,13 @@ import { concat, randomBytes, zeroize } from './primitives';
  *     (that share is then attacker-controlled, and the usual m-of-n
  *     threshold applies: t compromised signers = group key compromise).
  *   ✗ Does NOT defend against: nonce reuse (d_i, e_i MUST be fresh per
- *     session). This implementation generates them inside `commit()`.
- *     Callers who persist SignerPrivateNonce across sessions break the
- *     scheme.
+ *     session). sign() burns its input SignerPrivateNonce on success, so
+ *     passing the same object twice throws "nonce already used" — that
+ *     protects against the accidental-reuse bug pattern. But a caller
+ *     who reconstructs a fresh `{id, d, e}` object from previously-seen
+ *     scalar values bypasses this check; there is no persistent-state
+ *     defense in-library. Rule: treat SignerPrivateNonce as opaque and
+ *     single-use — never serialize d/e to durable storage.
  *   ⚠ Trusted-dealer setup: `dealGroupKey()` briefly holds the full group
  *     sk in memory, splits it, then zeroizes. Distributed key generation
  *     (DKG) is out of scope here; use a hardware HSM or air-gapped
@@ -242,6 +246,12 @@ export const sign = (
   groupPk: GroupPublicKey,
 ): PartialSignature => {
   if (nonce.id !== key.id) throw new Error('frost: nonce/key id mismatch');
+  // Single-shot nonce enforcement. Reusing (d, e) across two signatures with
+  // different messages leaks sk_i via linear algebra (audit finding G). We
+  // treat a zeroed nonce as "already burned" and refuse.
+  if (nonce.d === 0n || nonce.e === 0n) {
+    throw new Error('frost: nonce already used (single-shot required)');
+  }
   if (!commitments.some((c) => c.id === key.id)) {
     throw new Error('frost: my commitment is not in the list');
   }
@@ -261,6 +271,11 @@ export const sign = (
 
   const myBinder = binders.get(key.id)!;
   const z = modN(nonce.d + myBinder * nonce.e + lambda * key.sk * c);
+
+  // Burn the nonce unconditionally on success. Any subsequent sign() with the
+  // same nonce object will short-circuit on the zeroed-d/e check above.
+  (nonce as { d: bigint }).d = 0n;
+  (nonce as { e: bigint }).e = 0n;
 
   return { id: key.id, z: scalarToBytesLE(z) };
 };

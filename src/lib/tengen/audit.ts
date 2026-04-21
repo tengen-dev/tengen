@@ -19,9 +19,13 @@ import {
   verifyApproval,
   type QuorumPolicy,
 } from './quorum';
+import { dealGroupKey, sign as frostSign, verify as frostVerify, _internal } from './frost';
+import { dkgStart, dkgShareFor, dkgAcceptShare, dkgFinalize } from './dkg';
 import { isLikelyObserved } from './observer';
 import { randomBytes } from './primitives';
 import { obliviousFetchAll } from './integrity';
+import { createSession } from './ephemeral';
+import { shatter } from './shatter';
 
 type Verdict = 'CONFIRMED' | 'MITIGATED' | 'NOT_REPRODUCED';
 interface Finding {
@@ -319,6 +323,270 @@ const xorBytes = (a: Uint8Array, b: Uint8Array): Uint8Array => {
 };
 
 /* -------------------------------------------------------------------------- *
+ *  Attack G — FROST nonce reuse recovers sk_i via linear algebra.
+ *
+ *  Setup: single signer (for simplicity), three messages, same SignerPrivateNonce.
+ *  Partial signatures: z_k = d + ρ_k · e + λ · sk · c_k   (mod n)  for k=1..3
+ *  With three (ρ, c, z) triples and fixed (d, e, sk), we have 3 equations in
+ *  3 unknowns. Solve → recover sk.
+ *
+ *  The attack requires the SIGNER to reuse the nonce. Our sign() silently
+ *  accepts a reused nonce; a buggy or malicious client therefore leaks sk.
+ * -------------------------------------------------------------------------- */
+const attackG = async (): Promise<void> => {
+  const { modN, invModN, G, n, lagrangeCoeffAt0, hashToScalar, scalarFromBytesLE } = _internal;
+
+  // Threshold-of-1 gives us clean single-signer math (λ = 1, no other peers).
+  const { groupPk, signerKeys } = dealGroupKey(2, [1, 2, 3]);
+  // We'll run as signer 1 with peers (2, 3) present in commitments only so
+  // the λ matters; pick 2-of-3 to keep it realistic.
+  const me = signerKeys[0]!;
+
+  // Helper: produce a partial sig reusing the SAME (d, e) across 3 messages.
+  // We pass the same commitments list every time (so the observer sees the
+  // "signer is broadcasting the same (D,E) with 3 different message hashes").
+  // Use full sign() — this is precisely the bug we're demonstrating.
+  const peerCommits = [
+    { id: 2, D: G.multiply(7n).toRawBytes(), E: G.multiply(11n).toRawBytes() },
+    { id: 3, D: G.multiply(13n).toRawBytes(), E: G.multiply(17n).toRawBytes() },
+  ];
+  const myD = 1234567n;
+  const myE = 9876543n;
+  const myCommit = {
+    id: me.id,
+    D: G.multiply(myD).toRawBytes(),
+    E: G.multiply(myE).toRawBytes(),
+  };
+  const commitments = [myCommit, ...peerCommits];
+  const nonce = { id: me.id, d: myD, e: myE };
+
+  // Scenario 1: sign() is called with the SAME nonce object twice. This is
+  // the realistic-bug pattern (client forgets to rotate nonces between
+  // sessions). sign() now burns the nonce in place and re-signing throws.
+  const sharedNonce = { ...nonce };
+  let sameObjectCaught = false;
+  frostSign(me, sharedNonce, new TextEncoder().encode('first'), commitments, groupPk);
+  try {
+    frostSign(me, sharedNonce, new TextEncoder().encode('second'), commitments, groupPk);
+  } catch (e) {
+    sameObjectCaught = (e instanceof Error) && /nonce already used/.test(e.message);
+  }
+
+  // Scenario 2: attacker explicitly reconstructs fresh nonce objects from the
+  // raw d, e scalars (e.g., roundtrip through JSON). The library cannot catch
+  // this without persistent state; it is an API-contract violation rather
+  // than a runtime defense. We run the math to confirm sk-recovery still
+  // works for anyone who deliberately replays values.
+  const partials = [
+    frostSign(me, { ...nonce }, new TextEncoder().encode('msg-1'), commitments, groupPk),
+    frostSign(me, { ...nonce }, new TextEncoder().encode('msg-2'), commitments, groupPk),
+    frostSign(me, { ...nonce }, new TextEncoder().encode('msg-3'), commitments, groupPk),
+  ];
+
+  // Reconstruct (ρ, c) per message from public info — attacker recomputes
+  // exactly what sign() does internally because all inputs are public.
+  const bindingFactor = (id: number, msg: Uint8Array): bigint => {
+    const sorted = [...commitments].sort((a, b) => a.id - b.id);
+    const parts: Uint8Array[] = [new Uint8Array([id & 0xff]), msg];
+    for (const c of sorted) {
+      parts.push(new Uint8Array([c.id & 0xff]));
+      parts.push(c.D);
+      parts.push(c.E);
+    }
+    return hashToScalar('tengen:frost:rho:v1', ...parts);
+  };
+  const { ed25519 } = await import('@noble/curves/ed25519');
+  const buildR = (binders: Map<number, bigint>) => {
+    let acc = ed25519.ExtendedPoint.ZERO;
+    for (const c of commitments) {
+      const rho = binders.get(c.id)!;
+      const Dp = ed25519.ExtendedPoint.fromHex(c.D);
+      const Ep = ed25519.ExtendedPoint.fromHex(c.E);
+      acc = acc.add(Dp.add(Ep.multiply(rho)));
+    }
+    return acc;
+  };
+  const challengeScalar = (Rbytes: Uint8Array, msg: Uint8Array): bigint =>
+    hashToScalar('tengen:frost:c:v1', Rbytes, groupPk.bytes, msg);
+
+  const msgs = ['msg-1', 'msg-2', 'msg-3'].map((s) => new TextEncoder().encode(s));
+  const rhos: bigint[] = [];
+  const cs: bigint[] = [];
+  for (const m of msgs) {
+    const bMap = new Map<number, bigint>();
+    for (const c of commitments) bMap.set(c.id, bindingFactor(c.id, m));
+    const R = buildR(bMap);
+    rhos.push(bMap.get(me.id)!);
+    cs.push(challengeScalar(R.toRawBytes(), m));
+  }
+
+  // z_k = d + ρ_k · e + λ · sk · c_k  (mod n).  Subtract pairs to eliminate d:
+  //   z1 - z2 = (ρ1 - ρ2) e + λ (c1 - c2) sk
+  //   z2 - z3 = (ρ2 - ρ3) e + λ (c2 - c3) sk
+  // Solve the 2x2 system in (e, λ·sk).
+  const others = commitments.filter((c) => c.id !== me.id).map((c) => BigInt(c.id));
+  const lambda = lagrangeCoeffAt0(BigInt(me.id), others);
+
+  const [z1, z2, z3] = partials.map((p) => scalarFromBytesLE(p.z)) as [bigint, bigint, bigint];
+  const [r1, r2, r3] = rhos as [bigint, bigint, bigint];
+  const [c1, c2, c3] = cs as [bigint, bigint, bigint];
+
+  // A1·e + B1·(λ·sk) = Y1
+  // A2·e + B2·(λ·sk) = Y2
+  const A1 = modN(r1 - r2), B1 = modN(c1 - c2), Y1 = modN(z1 - z2);
+  const A2 = modN(r2 - r3), B2 = modN(c2 - c3), Y2 = modN(z2 - z3);
+  // det = A1·B2 - A2·B1
+  const det = modN(A1 * B2 - A2 * B1);
+  const lambdaSk = modN((A1 * Y2 - A2 * Y1) * invModN(det));
+  const recoveredSk = modN(lambdaSk * invModN(lambda));
+
+  const matches = recoveredSk === me.sk;
+  // Interpretation:
+  //   - sameObjectCaught TRUE  → realistic reuse bug is caught at runtime.
+  //   - matches          TRUE  → math is exploitable IF client bypasses the
+  //                              SignerPrivateNonce API (reconstructs raw d/e).
+  // The finding is MITIGATED when sameObjectCaught is true; matches on its
+  // own is a documentation/contract issue, not a runtime-defeatable one.
+  const verdict: Verdict =
+    sameObjectCaught && matches
+      ? 'MITIGATED'
+      : !sameObjectCaught
+        ? 'CONFIRMED'
+        : 'NOT_REPRODUCED';
+  findings.push({
+    id: 'G',
+    title: 'FROST nonce reuse leaks signer sk_i via linear recovery',
+    verdict,
+    severity: sameObjectCaught ? 'medium' : 'critical',
+    evidence:
+      `  sign() reuse of same nonce object → ${
+        sameObjectCaught ? 'BLOCKED (throws "nonce already used")' : 'ACCEPTED (critical bug)'
+      }\n` +
+      `  sk_i recovery via linear algebra with replayed d/e → ${matches ? 'WORKS' : 'fails'}\n` +
+      '  When the caller uses SignerPrivateNonce straight from commit() (no\n' +
+      '  cloning, no reconstruction), sign() now burns the nonce on success\n' +
+      '  and refuses reuse. A caller who deliberately reconstructs {id, d, e}\n' +
+      '  from raw scalars still bypasses the check — this is an API-contract\n' +
+      '  violation the library cannot detect without persistent state.\n' +
+      '  Documented in frost.ts Security Boundary: "nonces MUST be\n' +
+      '  single-shot; do not persist or reconstruct."',
+  });
+};
+
+/* -------------------------------------------------------------------------- *
+ *  Attack H — Shatter last-chunk size leaks "real blob #N".
+ *
+ *  When data length is not a multiple of chunkSize*n, the last chunk is
+ *  shorter, producing a shorter ciphertext even after decoys are size-matched
+ *  to the FIRST real blob. An observer who sorts blobs by size finds one
+ *  outlier — the final real chunk.
+ * -------------------------------------------------------------------------- */
+const attackH = async (): Promise<void> => {
+  const session = createSession();
+  // 23 bytes, n=5 → chunks of 5,5,5,5,3. After GCM: 21,21,21,21,19 bytes.
+  const data = new Uint8Array(23);
+  crypto.getRandomValues(data);
+
+  const { blobs } = await shatter(session, data, {
+    n: 5,
+    k: 3,
+    decoys: 20,
+    backends: 3,
+  });
+
+  const sizes = blobs.map((b) => b.body.length);
+  const sizeCounts = new Map<number, number>();
+  for (const s of sizes) sizeCounts.set(s, (sizeCounts.get(s) ?? 0) + 1);
+  const sorted = [...sizeCounts.entries()].sort((a, b) => b[1] - a[1]);
+  // If there's a distinct minority size, it uniquely identifies the last
+  // real blob to an observer.
+  const leak =
+    sorted.length >= 2 &&
+    (sorted[sorted.length - 1]?.[1] ?? 0) <= Math.ceil(sizes.length * 0.1);
+
+  findings.push({
+    id: 'H',
+    title: 'Shatter: last chunk size leaks real-blob identity',
+    verdict: leak ? 'CONFIRMED' : 'NOT_REPRODUCED',
+    severity: 'high',
+    evidence: leak
+      ? `blob sizes: ${[...sizeCounts.entries()]
+          .map(([s, c]) => `${s}×${c}`)
+          .join(', ')}.\n` +
+        '  Decoys are padded to match realBlobs[0].body.length, but the LAST\n' +
+        '  real chunk is shorter by (chunkSize − data.length % chunkSize). Its\n' +
+        '  GCM ciphertext is proportionally shorter → a single blob stands\n' +
+        '  alone in the size histogram. Fix: pad every chunk to chunkSize\n' +
+        '  before GCM; carry plaintext length in the manifest to strip at\n' +
+        '  reassemble.'
+      : 'blob sizes uniform — size leak not reproduced under this layout.',
+  });
+  session.burn();
+};
+
+/* -------------------------------------------------------------------------- *
+ *  Attack I — DKG commitment consistency not enforced across peers.
+ *
+ *  A malicious participant broadcasts different Feldman commitment sets to
+ *  different peers. Each peer's local share-verify passes (they check only
+ *  against the commitments THEY received from the malicious peer). Each
+ *  peer's finalize() succeeds — but they compute DIFFERENT groupPk values.
+ *
+ *  Without an echo/consistency round, no participant notices until a
+ *  signature produced under one group's view fails to verify under another's.
+ * -------------------------------------------------------------------------- */
+const attackI = async (): Promise<void> => {
+  // Three honest participants + one "malicious" polynomial that publishes
+  // two different commitment sets. We simulate this by having one
+  // attacker-role produce two independent polynomials.
+  const victimA = dkgStart(2, 2);
+  const victimB = dkgStart(3, 2);
+
+  // Malicious P1 prepares two polynomials:
+  const malA = dkgStart(1, 2);     // commitments shown to victimA
+  const malB = dkgStart(1, 2);     // different commitments shown to victimB
+  // But sends victimA a share derived from malA, and victimB a share from malB.
+
+  // victimA receives valid-looking share from malA.
+  const shareToA = dkgShareFor(malA, victimA.id);
+  const okA = dkgAcceptShare(victimA, 1, shareToA, malA.commitments);
+
+  // victimB receives valid-looking share from malB — DIFFERENT commitments.
+  const shareToB = dkgShareFor(malB, victimB.id);
+  const okB = dkgAcceptShare(victimB, 1, shareToB, malB.commitments);
+
+  // Honest cross-share between victimA and victimB.
+  dkgAcceptShare(victimA, victimB.id, dkgShareFor(victimB, victimA.id), victimB.commitments);
+  dkgAcceptShare(victimB, victimA.id, dkgShareFor(victimA, victimB.id), victimA.commitments);
+
+  // Both victims finalize — neither throws.
+  const finA = dkgFinalize(victimA, [1, 2, 3]);
+  const finB = dkgFinalize(victimB, [1, 2, 3]);
+
+  // Compare groupPks.
+  const pkHexA = Array.from(finA.groupPk.bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  const pkHexB = Array.from(finB.groupPk.bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  const splitBrain = okA && okB && pkHexA !== pkHexB;
+
+  findings.push({
+    id: 'I',
+    title: 'DKG: split-brain groupPk when malicious peer broadcasts divergent commitments',
+    verdict: splitBrain ? 'CONFIRMED' : 'NOT_REPRODUCED',
+    severity: 'medium',
+    evidence: splitBrain
+      ? `victim A finalized groupPk=${pkHexA.slice(0, 16)}…\n` +
+        `  victim B finalized groupPk=${pkHexB.slice(0, 16)}… (different)\n` +
+        '  Both victims\' local share-verify passed because each only saw the\n' +
+        '  commitment set addressed to them. Without an echo round where all\n' +
+        '  participants publish H({commitment-sets-received}) and verify\n' +
+        '  mutual agreement, the split is invisible until a signature fails\n' +
+        '  to verify under one view but not another. Out of scope for the\n' +
+        '  current DKG (documented in Security Boundary), but a real gap.'
+      : 'groupPks matched — attack path did not diverge as expected.',
+  });
+};
+
+/* -------------------------------------------------------------------------- *
  *  Report
  * -------------------------------------------------------------------------- */
 const main = async (): Promise<void> => {
@@ -328,6 +596,9 @@ const main = async (): Promise<void> => {
   await attackD();
   await attackE();
   await attackF();
+  await attackG();
+  await attackH();
+  await attackI();
 
   const sevRank = { critical: 4, high: 3, medium: 2, low: 1, informational: 0 } as const;
   findings.sort((a, b) => sevRank[b.severity] - sevRank[a.severity]);
