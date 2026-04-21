@@ -1,0 +1,35 @@
+# node / tooling
+node_modules/
+dist/
+*.tsbuildinfo
+.npm/
+.eslintcache
+
+# env
+.env
+.env.*
+!.env.example
+
+# tengen deploy outputs (contain deploy.key — never commit)
+pkg/
+*.key
+*.keyring
+
+# sbom: committed from CI artifact, not from dev machines
+sbom.json
+
+# go loader build output
+loader/tengen-loader
+loader/*.test
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# logs / coverage
+*.log
+coverage/
+.nyc_output/

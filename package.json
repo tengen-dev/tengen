@@ -1,0 +1,29 @@
+{
+  "name": "tengen",
+  "private": true,
+  "version": "0.0.1-research",
+  "description": "Research-grade stealth security architecture. NOT production-ready; NOT audited.",
+  "type": "module",
+  "bin": {
+    "tengen": "./src/cli/tengen.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test --import tsx 'src/lib/tengen/**/*.test.ts'",
+    "audit": "tsx src/lib/tengen/audit.ts",
+    "fuzz": "tsx src/lib/tengen/fuzz.ts",
+    "bench": "tsx src/lib/tengen/bench.ts",
+    "sbom": "npm sbom --sbom-format=cyclonedx --sbom-type=application > sbom.json",
+    "tengen": "tsx src/cli/tengen.ts"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "@noble/hashes": "^1.4.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "5.5.3"
+  }
+}
