@@ -2,9 +2,11 @@
 # INTENTIONAL vulnerable examples used as test fixtures or attack demos.
 # Format: <detector-id>:<file-regex>   or <detector-id>   or *:<file-regex>
 
-# Scanner unit tests declare synthetic vulnerable snippets as strings to
-# verify the detectors fire. They are not real app code.
+# Scanner + ward unit tests declare synthetic vulnerable snippets as
+# strings to verify the detectors fire or to demonstrate safe helpers.
+# They are not real app code.
 *:src/lib/tengen/scanner\.test\.ts
+*:src/lib/tengen/ward\.test\.ts
 
 # Adversarial self-audit deliberately constructs attack scenarios to
 # re-verify mitigations. The snippets are intentionally "bad".
