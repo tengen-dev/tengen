@@ -2,7 +2,9 @@
 
 **Status:** Pre-audit research codebase. No external review performed to date.
 
-**Scope contact:** tompark0927@gmail.com
+**Scope contact:** contact via GitHub issues on the repository
+(anonymized during pre-audit phase; will be updated to a dedicated
+security mailbox before engagement).
 **Repository:** https://github.com/Tompark0927/tengen  (private — access granted per engagement)
 
 **Proposed engagement length:** 2–4 weeks of reviewer time, plus 1 week
