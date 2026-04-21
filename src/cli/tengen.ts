@@ -18,12 +18,24 @@ import { join, resolve } from 'node:path';
 import { argv, exit, stderr, stdout } from 'node:process';
 import { deploy, run } from '../lib/tengen/deploy';
 import { deploymentRoot } from '../lib/tengen/integrity';
-import { formatReport, scanDir } from '../lib/tengen/scanner';
+import {
+  applyIgnore,
+  formatReport,
+  hasAtLeast,
+  parseIgnoreFile,
+  scanDir,
+  type Format,
+  type Severity,
+} from '../lib/tengen/scanner';
 
 const USAGE = `tengen <command> [args]
 
 Commands:
-  scan    <project-dir>                  — static vuln scan (SQLi, eval, XSS, secrets, …)
+  scan <project-dir>
+       [--format text|json|markdown|html]   default: text
+       [--fail-on critical|high|medium|low] exit 2 if any finding >= severity (default: high)
+       [--ignore <file>]                    path to .tengenignore-style rules
+       [--compliance]                       annotate findings with OWASP/CWE/SOC2/ISO27001
   deploy  <source-file> <out-dir> [--nodes N] [--decoys M] [--difficulty D] [--ttl-ms T]
   run     <pkg-dir>
   verify  <pkg-dir>
@@ -41,12 +53,18 @@ Notes:
 const hex = (b: Uint8Array): string =>
   Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 
+const BOOLEAN_FLAGS = new Set(['compliance']);
+
 const parseFlags = (args: string[]): Record<string, string> => {
   const out: Record<string, string> = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a.startsWith('--')) {
       const key = a.slice(2);
+      if (BOOLEAN_FLAGS.has(key)) {
+        out[key] = 'true';
+        continue;
+      }
       const val = args[i + 1];
       if (!val || val.startsWith('--')) {
         stderr.write(`error: --${key} requires a value\n`);
@@ -213,15 +231,37 @@ const cmdAudit = async (): Promise<void> => {
 
 // -------- scan ------------------------------------------------------------
 
+const isValidFormat = (v: string): v is Format => ['text', 'json', 'markdown', 'html'].includes(v);
+const isValidSeverity = (v: string): v is Severity =>
+  ['critical', 'high', 'medium', 'low'].includes(v);
+
 const cmdScan = async (args: string[]): Promise<void> => {
-  const [dir] = args;
-  if (!dir) fail('usage: tengen scan <project-dir>', 2);
-  const findings = await scanDir(resolve(dir));
-  stdout.write(formatReport(findings));
-  // Non-zero exit if any critical/high so CI can gate on it.
-  if (findings.some((f) => f.severity === 'critical' || f.severity === 'high')) {
-    exit(2);
+  const [dir, ...rest] = args;
+  if (!dir) fail('usage: tengen scan <project-dir> [flags]', 2);
+  const flags = parseFlags(rest);
+
+  const format: Format = flags['format']
+    ? (isValidFormat(flags['format']) ? flags['format'] : fail(`invalid --format: ${flags['format']}`, 2))
+    : 'text';
+  const failOn: Severity = flags['fail-on']
+    ? (isValidSeverity(flags['fail-on']) ? flags['fail-on'] : fail(`invalid --fail-on: ${flags['fail-on']}`, 2))
+    : 'high';
+  const compliance = flags['compliance'] === 'true';
+  const ignoreFlag = flags['ignore'];
+
+  const absDir = resolve(dir);
+  const raw = await scanDir(absDir);
+
+  // Discover ignore rules: explicit --ignore wins, else auto-find .tengenignore.
+  let rules: ReturnType<typeof parseIgnoreFile> = [];
+  const ignorePath = ignoreFlag ? resolve(ignoreFlag) : join(absDir, '.tengenignore');
+  if (existsSync(ignorePath)) {
+    rules = parseIgnoreFile(await readFile(ignorePath, 'utf8'));
   }
+  const findings = applyIgnore(raw, rules);
+
+  stdout.write(formatReport(findings, format, { compliance }));
+  if (hasAtLeast(findings, failOn)) exit(2);
 };
 
 // -------- dispatch --------------------------------------------------------

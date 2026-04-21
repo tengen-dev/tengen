@@ -37,6 +37,34 @@ export interface Finding {
   readonly fix: string;
 }
 
+/**
+ * Compliance mapping: each scanner detector is cross-referenced to the
+ * controls auditors care about. Keep these short — auditors don't need
+ * explanations, they need the control ID so they can tick a box.
+ */
+export interface ComplianceMap {
+  readonly owaspTop10?: string;
+  readonly cwe?: string;
+  readonly soc2?: string;
+  readonly iso27001?: string;
+}
+
+const COMPLIANCE: Record<string, ComplianceMap> = {
+  'SQLI-TEMPLATE':           { owaspTop10: 'A03:2021', cwe: 'CWE-89',  soc2: 'CC6.1', iso27001: 'A.8.28' },
+  'EVAL':                    { owaspTop10: 'A03:2021', cwe: 'CWE-95',  soc2: 'CC6.1', iso27001: 'A.8.28' },
+  'INNERHTML':               { owaspTop10: 'A03:2021', cwe: 'CWE-79',  soc2: 'CC6.1', iso27001: 'A.8.28' },
+  'DANGEROUSLY-SET-INNERHTML': { owaspTop10: 'A03:2021', cwe: 'CWE-79', soc2: 'CC6.1', iso27001: 'A.8.28' },
+  'HARDCODED-SECRET':        { owaspTop10: 'A07:2021', cwe: 'CWE-798', soc2: 'CC6.1', iso27001: 'A.8.24' },
+  'JWT-HARDCODED-SECRET':    { owaspTop10: 'A02:2021', cwe: 'CWE-798', soc2: 'CC6.1', iso27001: 'A.8.24' },
+  'MATH-RANDOM-SECURITY':    { owaspTop10: 'A02:2021', cwe: 'CWE-338', soc2: 'CC6.7', iso27001: 'A.8.24' },
+  'JSON-PARSE-REQUEST':      { owaspTop10: 'A03:2021', cwe: 'CWE-20',  soc2: 'CC6.1', iso27001: 'A.8.28' },
+  'OPEN-REDIRECT':           { owaspTop10: 'A01:2021', cwe: 'CWE-601', soc2: 'CC6.1', iso27001: 'A.8.28' },
+  'CORS-WILDCARD-CREDENTIALS': { owaspTop10: 'A05:2021', cwe: 'CWE-942', soc2: 'CC6.1', iso27001: 'A.5.14' },
+  'EXPOSED-ENV-CLIENT':      { owaspTop10: 'A05:2021', cwe: 'CWE-200', soc2: 'CC6.1', iso27001: 'A.8.2' },
+};
+
+export const complianceFor = (id: string): ComplianceMap | undefined => COMPLIANCE[id];
+
 export interface ScanOptions {
   /** Only scan files with these extensions. */
   readonly extensions?: readonly string[];
@@ -257,34 +285,258 @@ export const scanDir = async (rootDir: string, opts: ScanOptions = {}): Promise<
   return findings;
 };
 
-// ---- formatter ----------------------------------------------------------
+// ---- ignore files -------------------------------------------------------
+
+/**
+ * Parse a `.tengenignore`-style file. Each non-empty, non-`#` line is a
+ * pattern of the form `<id>:<file-regex>` or just `<id>`. Findings whose
+ * (id, file) match any rule are dropped. Regex is anchored to the start
+ * of the relative path.
+ */
+export interface IgnoreRule {
+  readonly id: string; // detector id or '*'
+  readonly fileRegex?: RegExp;
+}
+
+export const parseIgnoreFile = (content: string): IgnoreRule[] => {
+  const rules: IgnoreRule[] = [];
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const sep = line.indexOf(':');
+    if (sep === -1) {
+      rules.push({ id: line });
+    } else {
+      const id = line.slice(0, sep).trim();
+      const pattern = line.slice(sep + 1).trim();
+      try {
+        rules.push({ id, fileRegex: new RegExp('^' + pattern) });
+      } catch {
+        rules.push({ id });
+      }
+    }
+  }
+  return rules;
+};
+
+const matchesIgnore = (f: Finding, rules: readonly IgnoreRule[]): boolean =>
+  rules.some((r) => {
+    if (r.id !== '*' && r.id !== f.id) return false;
+    if (!r.fileRegex) return true;
+    return r.fileRegex.test(f.file);
+  });
+
+export const applyIgnore = (findings: readonly Finding[], rules: readonly IgnoreRule[]): Finding[] =>
+  findings.filter((f) => !matchesIgnore(f, rules));
+
+// ---- formatters ---------------------------------------------------------
+
+export type Format = 'text' | 'json' | 'markdown' | 'html';
 
 const SEV_ORDER: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 
-export const formatReport = (findings: readonly Finding[]): string => {
-  if (findings.length === 0) {
-    return 'tengen scan: 0 findings. Note: a clean report does not mean the code is secure.\n';
-  }
-  const sorted = [...findings].sort((a, b) => {
+const sortFindings = (findings: readonly Finding[]): Finding[] =>
+  [...findings].sort((a, b) => {
     if (SEV_ORDER[b.severity] !== SEV_ORDER[a.severity]) return SEV_ORDER[b.severity] - SEV_ORDER[a.severity];
     if (a.file !== b.file) return a.file.localeCompare(b.file);
     return a.line - b.line;
   });
-  const counts: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0 };
-  for (const f of sorted) counts[f.severity]++;
+
+const countBySev = (findings: readonly Finding[]): Record<Severity, number> => {
+  const c: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const f of findings) c[f.severity]++;
+  return c;
+};
+
+export interface FormatOptions {
+  /** Include OWASP / CWE / SOC 2 / ISO 27001 mapping in the output. */
+  readonly compliance?: boolean;
+}
+
+const textReport = (findings: readonly Finding[], opts: FormatOptions = {}): string => {
+  if (findings.length === 0) {
+    return 'tengen scan: 0 findings. Note: a clean report does not mean the code is secure.\n';
+  }
+  const sorted = sortFindings(findings);
+  const c = countBySev(sorted);
   const header =
     `tengen scan — ${findings.length} finding(s) ` +
-    `(critical ${counts.critical}, high ${counts.high}, medium ${counts.medium}, low ${counts.low})\n` +
+    `(critical ${c.critical}, high ${c.high}, medium ${c.medium}, low ${c.low})\n` +
     '─'.repeat(72) + '\n';
   const body = sorted
-    .map(
-      (f, i) =>
-        `\n[${i + 1}] ${f.severity.toUpperCase()} · ${f.id}  ${f.file}:${f.line}\n` +
+    .map((f, i) => {
+      const compline = opts.compliance
+        ? '\n    compliance: ' + renderComplianceLine(f.id)
+        : '';
+      return `\n[${i + 1}] ${f.severity.toUpperCase()} · ${f.id}  ${f.file}:${f.line}\n` +
         `    ${f.title}\n` +
         `    > ${f.snippet}\n` +
         `    why: ${f.why}\n` +
-        `    fix: ${f.fix}`,
-    )
+        `    fix: ${f.fix}` +
+        compline;
+    })
     .join('\n');
   return header + body + '\n';
+};
+
+const renderComplianceLine = (id: string): string => {
+  const c = COMPLIANCE[id];
+  if (!c) return '(unmapped)';
+  const parts: string[] = [];
+  if (c.owaspTop10) parts.push(`OWASP ${c.owaspTop10}`);
+  if (c.cwe) parts.push(c.cwe);
+  if (c.soc2) parts.push(`SOC2 ${c.soc2}`);
+  if (c.iso27001) parts.push(`ISO27001 ${c.iso27001}`);
+  return parts.join(' · ');
+};
+
+const jsonReport = (findings: readonly Finding[], opts: FormatOptions = {}): string => {
+  const sorted = sortFindings(findings);
+  const c = countBySev(sorted);
+  const payload = {
+    tool: 'tengen',
+    version: '0.0.1-research',
+    generatedAt: new Date().toISOString(),
+    summary: {
+      total: findings.length,
+      critical: c.critical,
+      high: c.high,
+      medium: c.medium,
+      low: c.low,
+    },
+    findings: sorted.map((f) => ({
+      id: f.id,
+      file: f.file,
+      line: f.line,
+      severity: f.severity,
+      title: f.title,
+      snippet: f.snippet,
+      why: f.why,
+      fix: f.fix,
+      ...(opts.compliance ? { compliance: COMPLIANCE[f.id] ?? {} } : {}),
+    })),
+  };
+  return JSON.stringify(payload, null, 2) + '\n';
+};
+
+const escapeHtml = (s: string): string =>
+  s.replace(/[&<>"']/g, (c) =>
+    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;',
+  );
+
+const markdownReport = (findings: readonly Finding[], opts: FormatOptions = {}): string => {
+  const sorted = sortFindings(findings);
+  const c = countBySev(sorted);
+  if (sorted.length === 0) {
+    return `# Tengen scan report\n\n**0 findings.** A clean report does not mean the code is secure.\n`;
+  }
+  const header =
+    `# Tengen scan report\n\n` +
+    `Generated ${new Date().toISOString()}\n\n` +
+    `| Critical | High | Medium | Low | Total |\n` +
+    `|---------:|-----:|-------:|----:|------:|\n` +
+    `| ${c.critical} | ${c.high} | ${c.medium} | ${c.low} | ${sorted.length} |\n\n`;
+  const body = sorted
+    .map((f, i) => {
+      const comp = opts.compliance
+        ? `\n**Compliance:** ${renderComplianceLine(f.id)}\n`
+        : '';
+      return `## ${i + 1}. ${f.severity.toUpperCase()} — ${f.title}\n\n` +
+        `**${f.id}** · \`${f.file}:${f.line}\`\n\n` +
+        '```\n' + f.snippet + '\n```\n\n' +
+        `**Why this matters:** ${f.why}\n\n` +
+        `**Fix:** ${f.fix}\n` +
+        comp;
+    })
+    .join('\n');
+  return header + body;
+};
+
+const htmlReport = (findings: readonly Finding[], opts: FormatOptions = {}): string => {
+  const sorted = sortFindings(findings);
+  const c = countBySev(sorted);
+  const sevColor: Record<Severity, string> = {
+    critical: '#b91c1c', high: '#c2410c', medium: '#a16207', low: '#4d7c0f',
+  };
+  const rows = sorted.map((f, i) => {
+    const comp = opts.compliance
+      ? `<div class="comp">${escapeHtml(renderComplianceLine(f.id))}</div>`
+      : '';
+    return `
+<section class="finding">
+  <div class="head">
+    <span class="badge" style="background:${sevColor[f.severity]}">${f.severity.toUpperCase()}</span>
+    <span class="id">${escapeHtml(f.id)}</span>
+    <span class="loc">${escapeHtml(f.file)}:${f.line}</span>
+    <span class="num">#${i + 1}</span>
+  </div>
+  <h3>${escapeHtml(f.title)}</h3>
+  <pre><code>${escapeHtml(f.snippet)}</code></pre>
+  <p><strong>Why:</strong> ${escapeHtml(f.why)}</p>
+  <p><strong>Fix:</strong> ${escapeHtml(f.fix)}</p>
+  ${comp}
+</section>`;
+  }).join('\n');
+
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Tengen scan report</title>
+<style>
+  :root { font-family: ui-sans-serif, system-ui, sans-serif; line-height: 1.5; color:#111; }
+  body { max-width: 920px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { margin: 0 0 .5rem; }
+  .meta { color:#666; font-size:.9rem; margin-bottom: 1rem; }
+  table { border-collapse: collapse; margin-bottom: 2rem; }
+  td, th { padding: .35rem .75rem; border: 1px solid #ddd; text-align: right; font-variant-numeric: tabular-nums; }
+  th { background:#f5f5f5; }
+  .finding { border: 1px solid #e5e5e5; border-radius: 6px; padding: 1rem 1.25rem; margin: 1rem 0; background:#fafafa; }
+  .head { display:flex; gap:.75rem; align-items:center; margin-bottom:.25rem; font-size:.85rem; color:#555; }
+  .badge { color:#fff; padding: .1rem .5rem; border-radius: 3px; font-weight:600; font-size:.75rem; }
+  .id { font-family: ui-monospace, monospace; color:#333; }
+  .loc { font-family: ui-monospace, monospace; color:#777; }
+  .num { margin-left:auto; color:#aaa; }
+  h3 { margin: .25rem 0 .5rem; }
+  pre { background:#f0f0f0; padding:.5rem .75rem; border-radius:4px; overflow-x:auto; }
+  .comp { font-size:.85rem; color:#555; margin-top:.25rem; border-top:1px dashed #ddd; padding-top:.4rem; }
+  footer { color:#666; font-size:.85rem; margin-top: 2rem; }
+</style>
+</head><body>
+<h1>Tengen scan report</h1>
+<div class="meta">generated ${new Date().toISOString()} · tengen 0.0.1-research</div>
+<table>
+  <thead><tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Total</th></tr></thead>
+  <tbody><tr>
+    <td>${c.critical}</td><td>${c.high}</td><td>${c.medium}</td><td>${c.low}</td><td>${sorted.length}</td>
+  </tr></tbody>
+</table>
+${sorted.length === 0 ? '<p><em>0 findings. A clean report does not mean the code is secure.</em></p>' : rows}
+<footer>
+  Tengen is pre-audit research code. The scanner is a heuristic first-pass; pair with a sound
+  static analyzer (Semgrep, CodeQL) before shipping. Missing detection does not imply safety.
+</footer>
+</body></html>
+`;
+};
+
+export const formatReport = (
+  findings: readonly Finding[],
+  format: Format = 'text',
+  opts: FormatOptions = {},
+): string => {
+  switch (format) {
+    case 'json':     return jsonReport(findings, opts);
+    case 'markdown': return markdownReport(findings, opts);
+    case 'html':     return htmlReport(findings, opts);
+    case 'text':
+    default:         return textReport(findings, opts);
+  }
+};
+
+// ---- gate helpers -------------------------------------------------------
+
+/** Return true if findings include any at or above the given severity. */
+export const hasAtLeast = (findings: readonly Finding[], min: Severity): boolean => {
+  const minRank = SEV_ORDER[min];
+  return findings.some((f) => SEV_ORDER[f.severity] >= minRank);
 };

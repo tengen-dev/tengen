@@ -1,7 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { formatReport, scanSource } from './scanner';
+import {
+  applyIgnore,
+  complianceFor,
+  formatReport,
+  hasAtLeast,
+  parseIgnoreFile,
+  scanSource,
+  type Finding,
+} from './scanner';
 import { securityHeaders } from './headers';
 
 test('scanner: flags SQL injection via template literal', () => {
@@ -133,4 +141,115 @@ test('headers: explicit frame-ancestors replaces default DENY', () => {
   const h = securityHeaders({ frameAncestors: ["'self'", 'https://example.com'] });
   assert.equal(h['X-Frame-Options'], undefined);
   assert.ok(h['Content-Security-Policy']?.includes("frame-ancestors 'self' https://example.com"));
+});
+
+// ---- formatter + flag tests --------------------------------------------
+
+const fixtureSrc = `
+const q = \`SELECT * FROM t WHERE id = \${id}\`;
+const token = Math.random().toString(36);
+`;
+
+test('formatReport: json mode returns parseable JSON with summary + findings', () => {
+  const findings = scanSource('x.ts', fixtureSrc);
+  const json = formatReport(findings, 'json');
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.tool, 'tengen');
+  assert.ok(parsed.summary.total >= 2);
+  assert.ok(Array.isArray(parsed.findings));
+  assert.equal(parsed.findings[0].severity, 'critical');
+});
+
+test('formatReport: markdown mode produces headings + code blocks', () => {
+  const findings = scanSource('x.ts', fixtureSrc);
+  const md = formatReport(findings, 'markdown');
+  assert.ok(md.includes('# Tengen scan report'));
+  assert.ok(md.includes('**Fix:**'));
+  assert.ok(md.includes('```'));
+});
+
+test('formatReport: html mode produces a complete document', () => {
+  const findings = scanSource('x.ts', fixtureSrc);
+  const html = formatReport(findings, 'html');
+  assert.ok(html.startsWith('<!doctype html>'));
+  assert.ok(html.includes('</html>'));
+  assert.ok(html.includes('SQLI-TEMPLATE'));
+});
+
+test('formatReport: compliance flag annotates each finding', () => {
+  const findings = scanSource('x.ts', fixtureSrc);
+  const txt = formatReport(findings, 'text', { compliance: true });
+  assert.ok(txt.includes('OWASP'));
+  assert.ok(txt.includes('CWE-'));
+});
+
+test('formatReport: html with compliance includes mapping block', () => {
+  const findings = scanSource('x.ts', fixtureSrc);
+  const html = formatReport(findings, 'html', { compliance: true });
+  assert.ok(html.includes('class="comp"'));
+});
+
+test('complianceFor: known id returns a mapping', () => {
+  const m = complianceFor('SQLI-TEMPLATE');
+  assert.equal(m?.owaspTop10, 'A03:2021');
+  assert.equal(m?.cwe, 'CWE-89');
+});
+
+test('complianceFor: unknown id returns undefined', () => {
+  assert.equal(complianceFor('NO-SUCH-DETECTOR'), undefined);
+});
+
+test('parseIgnoreFile: blanks and # comments are skipped', () => {
+  const rules = parseIgnoreFile(`
+# this is a comment
+SQLI-TEMPLATE
+
+HARDCODED-SECRET:src/fixtures/
+  `);
+  assert.equal(rules.length, 2);
+  assert.equal(rules[0]!.id, 'SQLI-TEMPLATE');
+  assert.equal(rules[1]!.id, 'HARDCODED-SECRET');
+  assert.ok(rules[1]!.fileRegex?.test('src/fixtures/whatever.ts'));
+  assert.ok(!rules[1]!.fileRegex?.test('src/real/code.ts'));
+});
+
+test('applyIgnore: id-only rule suppresses everywhere', () => {
+  const findings: readonly Finding[] = [
+    { id: 'EVAL', file: 'a.ts', line: 1, severity: 'critical', title: '', snippet: '', why: '', fix: '' },
+    { id: 'EVAL', file: 'b.ts', line: 1, severity: 'critical', title: '', snippet: '', why: '', fix: '' },
+    { id: 'INNERHTML', file: 'c.ts', line: 1, severity: 'high', title: '', snippet: '', why: '', fix: '' },
+  ];
+  const out = applyIgnore(findings, parseIgnoreFile('EVAL'));
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.id, 'INNERHTML');
+});
+
+test('applyIgnore: id + file regex only suppresses matching files', () => {
+  const findings: readonly Finding[] = [
+    { id: 'HARDCODED-SECRET', file: 'src/fixtures/a.ts', line: 1, severity: 'critical', title: '', snippet: '', why: '', fix: '' },
+    { id: 'HARDCODED-SECRET', file: 'src/prod.ts',       line: 1, severity: 'critical', title: '', snippet: '', why: '', fix: '' },
+  ];
+  const out = applyIgnore(findings, parseIgnoreFile('HARDCODED-SECRET:src/fixtures/'));
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.file, 'src/prod.ts');
+});
+
+test('applyIgnore: * wildcard rule suppresses everything under a path', () => {
+  const findings: readonly Finding[] = [
+    { id: 'EVAL', file: 'vendor/lib.js', line: 1, severity: 'critical', title: '', snippet: '', why: '', fix: '' },
+    { id: 'EVAL', file: 'src/a.js',      line: 1, severity: 'critical', title: '', snippet: '', why: '', fix: '' },
+  ];
+  const out = applyIgnore(findings, parseIgnoreFile('*:vendor/'));
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.file, 'src/a.js');
+});
+
+test('hasAtLeast: true when finding at or above threshold exists', () => {
+  const findings: readonly Finding[] = [
+    { id: 'X', file: 'a', line: 1, severity: 'medium', title: '', snippet: '', why: '', fix: '' },
+    { id: 'Y', file: 'b', line: 1, severity: 'high',   title: '', snippet: '', why: '', fix: '' },
+  ];
+  assert.equal(hasAtLeast(findings, 'high'), true);
+  assert.equal(hasAtLeast(findings, 'critical'), false);
+  assert.equal(hasAtLeast(findings, 'low'), true);
 });

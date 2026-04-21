@@ -1,0 +1,102 @@
+# Drop-in GitHub Action: Tengen security scan on every PR + main push.
+#
+# Copy this file to .github/workflows/tengen-scan.yml in your repo.
+# Pin @VERSION to a commit SHA if you want byte-reproducibility.
+#
+# What it does:
+#   1. Installs tengen from the pinned ref
+#   2. Runs `tengen scan` against your source directory
+#   3. Fails the PR if any critical or high finding is present
+#   4. Uploads an HTML report as a build artifact (auditor-friendly)
+#   5. Comments a markdown summary on the PR
+#
+# Customize the marked sections for your repo layout.
+
+name: tengen-scan
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # for the PR comment; omit if you don't want comments
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # --- CUSTOMIZE: pick how you install tengen ------------------------
+      # Option A — install from the public repo at a pinned commit.
+      - name: Install tengen (from GitHub)
+        run: |
+          git clone --depth 1 https://github.com/Tompark0927/tengen /tmp/tengen
+          cd /tmp/tengen
+          npm ci --omit=optional
+
+      # Option B — add tengen as a devDependency in your own package.json
+      # and install normally. Remove Option A and uncomment below:
+      # - name: Install project deps
+      #   run: npm ci
+      # -----------------------------------------------------------------
+
+      - name: Run tengen scan (HTML report)
+        run: |
+          cd /tmp/tengen
+          ./node_modules/.bin/tsx src/cli/tengen.ts scan "$GITHUB_WORKSPACE/src" \
+            --format html \
+            --compliance \
+            --fail-on high \
+            > "$GITHUB_WORKSPACE/tengen-scan.html" || echo "SCAN_FAILED=1" >> "$GITHUB_ENV"
+
+      - name: Run tengen scan (markdown summary for PR comment)
+        if: github.event_name == 'pull_request'
+        run: |
+          cd /tmp/tengen
+          ./node_modules/.bin/tsx src/cli/tengen.ts scan "$GITHUB_WORKSPACE/src" \
+            --format markdown \
+            --compliance \
+            --fail-on high \
+            > "$GITHUB_WORKSPACE/tengen-scan.md" || true
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tengen-scan-report
+          path: tengen-scan.html
+          retention-days: 90
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.existsSync('tengen-scan.md')
+              ? fs.readFileSync('tengen-scan.md', 'utf8')
+              : '_tengen scan produced no report_';
+            const trimmed = body.length > 60000 ? body.slice(0, 60000) + '\n\n_(truncated)_' : body;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.name,
+              issue_number: context.issue.number,
+              body: trimmed,
+            });
+
+      - name: Fail job if scan failed
+        if: env.SCAN_FAILED == '1'
+        run: |
+          echo "tengen scan reported critical/high findings — see tengen-scan-report artifact."
+          exit 1

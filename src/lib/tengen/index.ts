@@ -169,8 +169,16 @@ export {
   scanDir,
   scanSource,
   formatReport,
+  parseIgnoreFile,
+  applyIgnore,
+  hasAtLeast,
+  complianceFor,
   type Finding,
   type ScanOptions,
+  type Format,
+  type FormatOptions,
+  type IgnoreRule,
+  type ComplianceMap,
 } from './scanner';
 
 export { securityHeaders, type HeaderOptions } from './headers';

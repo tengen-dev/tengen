@@ -52,6 +52,28 @@ cd tengen
 npm install
 ```
 
+## Why use this
+
+**For individuals:** you shipped an AI-generated app and you're worried.
+Run `tengen scan` in 5 seconds. If it's clean, breathe. If it's not,
+the tool tells you exactly which line, why it's dangerous, and how to
+fix it. See [`docs/AI_ANTIPATTERNS.md`](docs/AI_ANTIPATTERNS.md) for the
+catalogue of 20 common vulnerabilities AI tools ship by default.
+
+**For teams / startups preparing for SOC 2 / ISO 27001:**
+`tengen scan --compliance` annotates every finding with OWASP Top 10,
+CWE, SOC 2 CC, and ISO 27001 Annex A control mappings. Export with
+`--format html` for an auditor-ready report.
+See [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) for the full mapping +
+an evidence checklist auditors actually ask for. Drop-in GitHub Action
+at [`docs/github-action-tengen-scan.yml`](docs/github-action-tengen-scan.yml).
+
+**What tengen scan catches that `npm audit` doesn't:**
+`npm audit` finds known-vulnerable dependencies. `tengen scan` finds
+vulnerabilities in YOUR CODE — the SQL injection on line 42 of your
+own router, the `Math.random()` session token, the hardcoded Stripe
+key. The two tools are complements, not substitutes.
+
 ## 60-second demo
 
 ```bash
@@ -98,11 +120,16 @@ shipping anything non-trivial.
 ## CLI
 
 ```bash
-tengen scan <project-dir>                   # vuln report; exits 2 if critical/high found
-tengen deploy <source-file> <out-dir>        # encrypt + fragment a file
-tengen verify <pkg-dir>                      # recompute Merkle root
-tengen run    <pkg-dir>                      # execute chain, recover source to stdout
-tengen audit                                 # run the adversarial self-audit
+tengen scan <project-dir>
+  [--format text|json|markdown|html]      default: text
+  [--fail-on critical|high|medium|low]    default: high  (exits 2 on match)
+  [--ignore <path>]                       default: <project-dir>/.tengenignore
+  [--compliance]                          annotate with OWASP/CWE/SOC2/ISO
+
+tengen deploy <source-file> <out-dir>     # encrypt + fragment a file
+tengen verify <pkg-dir>                   # recompute Merkle root
+tengen run    <pkg-dir>                   # execute chain, recover source to stdout
+tengen audit                              # run the adversarial self-audit
 tengen version
 ```
 
